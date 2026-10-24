@@ -1,0 +1,4 @@
+numpy>=1.24
+# Install an appropriate CPU or CUDA build from pytorch.org first if desired.
+torch>=2.2
+tensorboard>=2.14
