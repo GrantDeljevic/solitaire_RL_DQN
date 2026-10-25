@@ -1,194 +1,342 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from collections import namedtuple
+"""Legal-action Double DQN for draw-three Klondike.
+
+Train: python network.py --mode train --episodes 10000
+Evaluate: python network.py --mode evaluate --checkpoint checkpoints/best.pt
+"""
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from dataclasses import dataclass
+import json
+from pathlib import Path
 import random
-import torch.nn.functional as F
-from solitaire_environment import SolitaireEnvironment
-import math
-from itertools import count
+
 import numpy as np
-from torch.utils.tensorboard import SummaryWriter
-import os
-import sys
-#check the names of other folders in the runs directory
-list_of_files = os.listdir('runs')
-#check the last number of the folder name
-last_number = int(list_of_files[-1][-1])
-#add one to the last number
-new_number = last_number + 1
-folder_name = 'runs/solitaire_experiment_' + str(new_number)
-writer = SummaryWriter(folder_name)
-# torch.manual_seed(923817727448500)
-# random.seed(0)
-# np.random.seed(0)
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+from solitaire_environment import ACTION_SIZE, OBS_SIZE, Move, SolitaireEnvironment
 
 
-# Hyperparameters
-BATCH_SIZE = 128
-GAMMA = 0.99
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 200
-STATE_SIZE = 26624
-TARGET_UPDATE = 10
-Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+class QNetwork(nn.Module):
+    """Q(s, a), for any legal action; no huge, mostly-invalid action head."""
 
-class DQN(nn.Module):
-    def __init__(self, STATE_SIZE, action_size, hidden_size=64):
-        super(DQN, self).__init__()
-        self.fc1 = nn.Linear(STATE_SIZE, hidden_size)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.fc3 = nn.Linear(hidden_size, action_size)
+    def __init__(self, hidden_size: int = 256):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(OBS_SIZE + ACTION_SIZE, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size), nn.ReLU(),
+            nn.Linear(hidden_size, 1),
+        )
 
-    def forward(self, x):
-        x = x.view(-1, STATE_SIZE)  # reshape x to have a size of STATE_SIZE
-        x = x.float()  # convert x to Float
-        x = self.relu(self.fc1(x))
-        x = self.relu(self.fc2(x))
-        return self.fc3(x)
+    def forward(self, states: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        return self.layers(torch.cat((states.float(), actions.float()), dim=-1)).squeeze(-1)
 
 
-def get_state_representation(env):
-    state_representation = np.zeros((STATE_SIZE // 4, 4))  # 4 positions for each card: tableau, foundation, waste, stock
+@dataclass
+class Transition:
+    state: np.ndarray
+    action: np.ndarray
+    reward: float
+    next_state: np.ndarray
+    next_actions: np.ndarray
+    done: bool
 
-    # Encode cards in the tableau
-    for pile_index, pile in enumerate(env.table):
-        for card in pile:
-            if card.face_up:
-                index = card.suit * 13 + card.value - 1
-                state_representation[index][0] = pile_index + 1  # Use pile index to encode position in tableau
-
-    # Encode cards in the foundation
-    for pile_index, pile in enumerate(env.top):
-        for card in pile:
-            index = card.suit * 13 + card.value - 1
-            state_representation[index][1] = pile_index + 1
-
-    # Encode the waste pile
-    for group in env.deck.faceup:
-        for card in group:
-            index = card.suit * 13 + card.value - 1
-            state_representation[index] = 3
-
-    # Encode the remaining deck
-    for group in env.deck.facedown:
-        index = card.suit * 13 + card.value - 1
-        state_representation[index] = 4
-
-    return state_representation.flatten()  # Flatten the array to 1D
-
-def select_action(q_values, epsilon, num_actions):
-    if random.random() > epsilon:
-        return q_values.max() # Exploit: choose the best action
-    else:
-        return torch.tensor([[random.randrange(num_actions)]], dtype=torch.long)  # Explore: choose a random action
 
 class ReplayMemory:
-    def __init__(self, capacity):
-        self.capacity = capacity
-        self.memory = []
-        self.position = 0
+    def __init__(self, capacity: int):
+        self.memory: deque[Transition] = deque(maxlen=capacity)
 
-    def push(self, *args):
-        if len(self.memory) < self.capacity:
-            self.memory.append(None)
-        self.memory[self.position] = Transition(*args)
-        self.position = (self.position + 1) % self.capacity
+    def push(self, transition: Transition) -> None:
+        self.memory.append(transition)
 
-    def sample(self, batch_size):
-        return random.sample(self.memory, batch_size)
+    def sample(self, batch_size: int, rng: random.Random) -> list[Transition]:
+        return rng.sample(self.memory, batch_size)
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.memory)
-env = SolitaireEnvironment()
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-device = torch.device("cpu")
-n_actions = 110  # Set this to the actual number of possible actions
 
-policy_net = DQN(STATE_SIZE, n_actions).to(device)
-target_net = DQN(STATE_SIZE, n_actions).to(device)
-target_net.load_state_dict(policy_net.state_dict())
-target_net.eval()
 
-optimizer = optim.Adam(policy_net.parameters())
-memory = ReplayMemory(10000)
+def action_values(model: QNetwork, state: np.ndarray,
+                  feats: np.ndarray, device: torch.device) -> np.ndarray:
+    if len(feats) == 0:
+        return np.empty(0, dtype=np.float32)
+    with torch.no_grad():
+        s = torch.from_numpy(np.broadcast_to(state, (len(feats), OBS_SIZE)).copy()).to(device)
+        a = torch.from_numpy(feats).to(device)
+        return model(s, a).cpu().numpy()
 
-def optimize_model():
-    if len(memory) < BATCH_SIZE:
-        return
-    transitions = memory.sample(BATCH_SIZE)
-    # Convert batch-array of Transitions to Transition of batch-arrays
-    batch = Transition(*zip(*transitions))
 
- # Compute a mask of non-final states and concatenate the batch elements
-    non_final_mask = torch.tensor(tuple(map(lambda s: s is not None, batch.next_state)), dtype=torch.bool)
-    non_final_next_states = torch.cat([torch.from_numpy(s) for s in batch.next_state if s is not None])
-    state_batch = torch.cat([torch.from_numpy(s) for s in batch.state])
-    action_batch = torch.stack([torch.tensor(a).view(1) for a in batch.action]).long()
-    reward_batch = torch.stack([torch.tensor(r) for r in batch.reward])
+def choose_action(env: SolitaireEnvironment, model: QNetwork | None,
+                  epsilon: float, rng: random.Random, device: torch.device,
+                  strategy: str = "learned") -> tuple[Move, np.ndarray]:
+    moves = env.legal_actions()
+    if not moves:
+        raise RuntimeError("No legal actions")
+    features = np.stack([env.action_features(m) for m in moves])
+    if strategy == "random" or rng.random() < epsilon:
+        index = rng.randrange(len(moves))
+    elif strategy == "heuristic":
+        priority = {
+            "tableau_foundation": 8.0, "waste_foundation": 8.0,
+            "tableau_tableau": 1.0, "waste_tableau": 2.0,
+            "draw": 0.0, "foundation_tableau": -5.0,
+        }
+        scores = [priority[m.kind] +
+                  (5.0 if m.kind == "tableau_tableau" and
+                   len(env.tableau[m.src]) > m.count and
+                   not env.tableau[m.src][-m.count - 1].face_up else 0.0)
+                  for m in moves]
+        index = int(np.argmax(scores))
+    else:
+        if model is None:
+            raise ValueError("A trained model is required for learned selection")
+        index = int(np.argmax(action_values(model, env.observe(), features, device)))
+    return moves[index], features[index].copy()
 
-    # Compute Q(s_t, a) - the model computes Q(s_t), then we select the columns of actions taken
-    state_action_values = policy_net(state_batch).gather(1, action_batch)
-    # Compute V(s_{t+1}) for all next states
-    next_state_values = torch.zeros(BATCH_SIZE)
-    next_state_values[non_final_mask] = target_net(non_final_next_states).max(1)[0].detach()
 
-    # Compute the expected Q values
-    expected_state_action_values = (next_state_values * GAMMA) + reward_batch
+def optimize(model: QNetwork, target: QNetwork, optimizer: torch.optim.Optimizer,
+             memory: ReplayMemory, batch_size: int, gamma: float,
+             device: torch.device, rng: random.Random) -> float | None:
+    if len(memory) < batch_size:
+        return None
+    batch = memory.sample(batch_size, rng)
+    states = torch.tensor(np.stack([t.state for t in batch]), device=device)
+    actions = torch.tensor(np.stack([t.action for t in batch]), device=device)
+    rewards = torch.tensor([t.reward for t in batch], device=device, dtype=torch.float32)
+    dones = torch.tensor([t.done for t in batch], device=device, dtype=torch.bool)
+    q = model(states, actions)
 
-    # Compute Huber loss
-    loss = F.smooth_l1_loss(state_action_values, expected_state_action_values.unsqueeze(1))
+    # Double DQN: online network selects the best *legal* successor action;
+    # target network estimates its value. Terminal states have no bootstrap.
+    with torch.no_grad():
+        next_values = torch.zeros(batch_size, device=device)
+        active = [i for i, t in enumerate(batch) if not t.done and len(t.next_actions)]
+        if active:
+            lengths = [len(batch[i].next_actions) for i in active]
+            next_states = np.concatenate([
+                np.repeat(batch[i].next_state[None, :], n, axis=0)
+                for i, n in zip(active, lengths)
+            ])
+            next_actions = np.concatenate([batch[i].next_actions for i in active])
+            ns = torch.tensor(next_states, device=device)
+            na = torch.tensor(next_actions, device=device)
+            online_q = model(ns, na)
+            cursor = 0
+            selected_state = []
+            selected_action = []
+            for i, n in zip(active, lengths):
+                j = int(torch.argmax(online_q[cursor:cursor + n]).item())
+                selected_state.append(batch[i].next_state)
+                selected_action.append(batch[i].next_actions[j])
+                cursor += n
+            target_q = target(torch.tensor(np.stack(selected_state), device=device),
+                              torch.tensor(np.stack(selected_action), device=device))
+            next_values[torch.tensor(active, device=device)] = target_q
+        td_target = rewards + gamma * next_values * (~dones).float()
 
-    # Optimize the model
-    optimizer.zero_grad()
+    loss = F.smooth_l1_loss(q, td_target)
+    optimizer.zero_grad(set_to_none=True)
     loss.backward()
-    for param in policy_net.parameters():
-        param.grad.data.clamp_(-1, 1)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
     optimizer.step()
-    
-    writer.add_scalar('Loss', loss.item(), steps_done)
+    return float(loss.item())
 
 
-num_episodes = 50
-steps_done = 0
-for episode in range(num_episodes):
-    env.reset()
-    state = get_state_representation(env)
-    total_reward = 0
-    for t in count():
-        while True:
-            # Select and perform an action
-            action = select_action(state, EPS_START, n_actions)
-            reward, done, return_dict = env.step(action.item())
-            try:
-                if return_dict["error"] == "Invalid move":
-                    continue
-                else:
-                    break
-            except:
-                break
-        next_state = get_state_representation(env)
-        total_reward += reward
-        writer.add_scalar('Total_reward', total_reward, steps_done)
-        writer.add_scalar('Reward', reward, steps_done)
-        # Store the transition in memory
-        memory.push(state, action, next_state, reward)
+def environment(args: argparse.Namespace, seed: int) -> SolitaireEnvironment:
+    return SolitaireEnvironment(seed=seed, draw_count=args.draw_count,
+                                max_redeals=args.max_redeals,
+                                max_steps=args.max_steps, max_stall=args.max_stall)
 
-        # Move to the next state
-        state = next_state
 
-        # Perform one step of the optimization (on the target network)
-        optimize_model()
-        steps_done += 1
-        if t % TARGET_UPDATE == 0:
-            target_net.load_state_dict(policy_net.state_dict())
+def evaluate(model: QNetwork | None, args: argparse.Namespace,
+             seeds: list[int], strategy: str = "learned") -> dict[str, float]:
+    device = torch.device(args.device)
+    if model is not None:
+        model.eval()
+    wins = foundations = reveals = moves = 0
+    for seed in seeds:
+        env = environment(args, seed)
+        rng = random.Random(seed + 900_000)
+        while not env.done:
+            action, _ = choose_action(env, model, 0.0, rng, device, strategy)
+            _, done, info = env.step(action)
+            if done:
+                wins += int(info["won"])
+                foundations += info["foundation_cards"]
+                reveals += 21 - info["face_down"]
+                moves += info["steps"]
+    n = max(1, len(seeds))
+    return {"win_rate": wins / n, "foundation": foundations / n,
+            "revealed": reveals / n, "steps": moves / n}
 
-        if done:
-            break
-    # Update the DQN model
-    optimize_model()
 
-    epsilon = EPS_END + (EPS_START - EPS_END) * math.exp(-1. * steps_done / EPS_DECAY)
-writer.close()
+def save_checkpoint(path: Path, policy: QNetwork, target: QNetwork,
+                    optimizer: torch.optim.Optimizer, episode: int,
+                    steps: int, best_score: float, args: argparse.Namespace) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save({"policy": policy.state_dict(), "target": target.state_dict(),
+                "optimizer": optimizer.state_dict(), "episode": episode,
+                "steps": steps, "best_score": best_score,
+                "settings": {k: getattr(args, k) for k in
+                             ("draw_count", "max_redeals", "max_steps", "max_stall", "hidden_size")}}, path)
+
+
+def load_checkpoint(path: str, policy: QNetwork, device: torch.device) -> dict:
+    # Only load checkpoints you trust. PyTorch state_dicts use pickle storage.
+    obj = torch.load(path, map_location=device, weights_only=True)
+    policy.load_state_dict(obj["policy"])
+    return obj
+
+
+def train(args: argparse.Namespace) -> None:
+    device = torch.device(args.device)
+    rng = random.Random(args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    model = QNetwork(args.hidden_size).to(device)
+    target = QNetwork(args.hidden_size).to(device)
+    target.load_state_dict(model.state_dict())
+    target.eval()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    memory = ReplayMemory(args.replay_size)
+    writer = None
+    if not args.no_tensorboard:
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            writer = SummaryWriter(args.logdir)
+        except ImportError:
+            print("TensorBoard unavailable; logging to console only")
+
+    steps = 0
+    start_episode = 0
+    best_score = float("-inf")
+    if args.resume:
+        ckpt = load_checkpoint(args.resume, model, device)
+        if ckpt.get("settings") != {k: getattr(args, k) for k in
+                ("draw_count", "max_redeals", "max_steps", "max_stall", "hidden_size")}:
+            raise ValueError("Checkpoint environment/model settings don't match")
+        target.load_state_dict(ckpt["target"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_episode = ckpt["episode"]
+        steps = ckpt["steps"]
+        best_score = ckpt["best_score"]
+        print("Resuming weights/optimizer; replay buffer starts empty")
+
+    env = environment(args, args.seed)
+    last_losses: list[float] = []
+    try:
+        for episode in range(start_episode + 1, args.episodes + 1):
+            obs = env.reset(seed=args.seed + episode)
+            total_reward = 0.0
+            while not env.done:
+                eps = args.eps_end + (args.eps_start - args.eps_end) * \
+                      max(0.0, 1.0 - steps / max(1, args.eps_decay_steps))
+                action, features = choose_action(env, model, eps, rng, device)
+                reward, done, info = env.step(action)
+                next_obs = env.observe()
+                next_feats = (np.stack([env.action_features(m) for m in env.legal_actions()])
+                              if not done else np.zeros((0, ACTION_SIZE), dtype=np.float32))
+                memory.push(Transition(obs.copy(), features, float(reward),
+                                       next_obs.copy(), next_feats, done))
+                obs = next_obs
+                total_reward += reward
+                steps += 1
+                if steps >= args.warmup and steps % args.train_every == 0:
+                    loss = optimize(model, target, optimizer, memory, args.batch_size,
+                                    args.gamma, device, rng)
+                    if loss is not None:
+                        last_losses.append(loss)
+                        if len(last_losses) > 100:
+                            last_losses.pop(0)
+                if steps % args.target_every == 0:
+                    target.load_state_dict(model.state_dict())
+            if writer:
+                writer.add_scalar("train/reward", total_reward, episode)
+                writer.add_scalar("train/foundation", info["foundation_cards"], episode)
+                writer.add_scalar("train/win", int(info["won"]), episode)
+                writer.add_scalar("train/epsilon", eps, episode)
+                if last_losses:
+                    writer.add_scalar("train/loss", float(np.mean(last_losses)), episode)
+            if episode % args.log_every == 0:
+                print(f"episode={episode} steps={steps} epsilon={eps:.3f} "
+                      f"foundation={info['foundation_cards']} won={info['won']} "
+                      f"reward={total_reward:.2f} "
+                      f"loss={np.mean(last_losses) if last_losses else float('nan'):.4f}", flush=True)
+            if episode % args.eval_every == 0:
+                # Fixed validation deals allow paired comparisons, not a proof
+                # of generalization. Use disjoint unseen test deals later.
+                results = evaluate(model, args, [100_000+i for i in range(args.eval_games)])
+                score = results["win_rate"] * 100 + results["foundation"] / 52.0
+                print("validation", episode, json.dumps(results), flush=True)
+                if writer:
+                    for name, val in results.items():
+                        writer.add_scalar("validation/" + name, val, episode)
+                if score > best_score:
+                    best_score = score
+                    save_checkpoint(Path(args.checkpoint_dir)/"best.pt", model,
+                                    target, optimizer, episode, steps, best_score, args)
+                save_checkpoint(Path(args.checkpoint_dir)/"last.pt", model,
+                                target, optimizer, episode, steps, best_score, args)
+        save_checkpoint(Path(args.checkpoint_dir)/"last.pt", model, target,
+                        optimizer, args.episodes, steps, best_score, args)
+    finally:
+        if writer:
+            writer.close()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("train", "evaluate"), default="train")
+    parser.add_argument("--checkpoint", help="Trained model checkpoint for evaluation")
+    parser.add_argument("--resume", help="Resume a training checkpoint")
+    parser.add_argument("--episodes", type=int, default=10000)
+    parser.add_argument("--eval-games", type=int, default=100)
+    parser.add_argument("--eval-every", type=int, default=250)
+    parser.add_argument("--log-every", type=int, default=25)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--draw-count", type=int, choices=(1, 3), default=3)
+    parser.add_argument("--max-redeals", type=int, default=2,
+                        help="-1 permits unlimited redeals")
+    parser.add_argument("--max-steps", type=int, default=400)
+    parser.add_argument("--max-stall", type=int, default=150)
+    parser.add_argument("--hidden-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--replay-size", type=int, default=50000)
+    parser.add_argument("--warmup", type=int, default=2000)
+    parser.add_argument("--train-every", type=int, default=4)
+    parser.add_argument("--target-every", type=int, default=2000)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--eps-start", type=float, default=1.0)
+    parser.add_argument("--eps-end", type=float, default=0.05)
+    parser.add_argument("--eps-decay-steps", type=int, default=200000)
+    parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--logdir", default="runs/solitaire_ddqn")
+    parser.add_argument("--checkpoint-dir", default="checkpoints")
+    parser.add_argument("--no-tensorboard", action="store_true")
+    args = parser.parse_args()
+    args.max_redeals = None if args.max_redeals == -1 else args.max_redeals
+    if args.mode == "train":
+        train(args)
+    else:
+        model = None
+        if args.checkpoint:
+            saved = torch.load(args.checkpoint, map_location=args.device, weights_only=True)
+            settings = saved.get("settings", {})
+            for key in ("draw_count", "max_redeals", "max_steps", "max_stall", "hidden_size"):
+                if key in settings:
+                    setattr(args, key, settings[key])
+            model = QNetwork(args.hidden_size).to(args.device)
+            model.load_state_dict(saved["policy"])
+        seeds = [1_000_000+i for i in range(args.eval_games)]
+        for strategy in (["random", "heuristic", "learned"] if model else
+                         ["random", "heuristic"]):
+            print(strategy, json.dumps(evaluate(model, args, seeds, strategy)))
+
+
+if __name__ == "__main__":
+    main()

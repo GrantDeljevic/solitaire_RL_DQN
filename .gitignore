@@ -1,1 +1,9 @@
 __pycache__/
+*.py[cod]
+.venv/
+checkpoints/
+runs/
+*.pt
+*.pth
+*.csv
+.pytest_cache/

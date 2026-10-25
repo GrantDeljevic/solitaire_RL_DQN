@@ -1,321 +1,295 @@
+"""Draw-three Klondike with observable (not omniscient) agent inputs.
+
+Tableau positions increase from bottom to top. The final card is the playable
+end of a pile; only the exposed portion of the tableau is observable.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
 import random
+from typing import Optional
+
 import numpy as np
-import math
-# card.suit  # 0=spades, 1=hearts, 2=clubs, 3=diamonds
-# card.value # 1 = Ace, 2 = 2, ... 10 = 10, 11 = Jack, 12 = Queen, 13 = King
+
+SUITS = 4
+TABLEAU = 7
+MAX_CARDS = 13
+ACTION_TYPES = (
+    "draw", "tableau_tableau", "tableau_foundation",
+    "waste_tableau", "waste_foundation", "foundation_tableau",
+)
+ACTION_SIZE = len(ACTION_TYPES) + 12 + 11 + 13 + 4 + 3
+OBS_SIZE = TABLEAU * (1 + MAX_CARDS * 5) + SUITS + 4 + 24 * 5 + 52
 
 
-
+@dataclass
 class Card:
-    def __init__(self, suit, value, face_up=False):
-        self.suit = suit
-        self.value = value
-        self.face_up = face_up
+    suit: int  # 0 spades, 1 hearts, 2 clubs, 3 diamonds
+    rank: int  # 1 ace through 13 king
+    face_up: bool = False
 
-    def flip(self):
-        self.face_up = not self.face_up
+    @property
+    def color(self) -> int:
+        return self.suit % 2
 
-    def __str__(self):
-        suits = ["Spades", "Hearts", "Clubs", "Diamonds"]
-        return str(self.value) + " of " + suits[self.suit]
 
-class Deck:
-    def __init__(self):
-        self.cards = self.create_deck()
-        self.shuffle()
-        self.table_cards = self.cards[0:28]
-        self.cards = self.cards[28:]
-        self.grouped_cards = self.group_cards()
-        self.faceup = []
-        self.facedown = self.cards
-        self.draw()
-        self.n_facedown = self.get_face_down()
-        
+@dataclass(frozen=True)
+class Move:
+    kind: str
+    src: int = -1
+    dst: int = -1
+    count: int = 1
 
-    def shuffle(self):
-        random.shuffle(self.cards)
 
-    def create_deck(self):
-        suits = [0,1,2,3]
-        values = list(range(1,14))
-        cards = []
-        for suit in suits:
-            for value in values:
-                cards.append(Card(suit, value))
-        return cards
-
-    def reorder(self):
-        # Move the cards from faceup to facedown, reversing the order
-        while self.faceup:
-            self.facedown.extend(self.faceup.pop()[::-1])
-
-    def draw(self):
-        if len(self.facedown) == 0:
-            self.reorder()
-
-        if len(self.facedown) > 3:
-            self.faceup.append(self.facedown[0:3])
-            self.facedown = self.facedown[3:]
-        else:
-            self.faceup.append(self.facedown)
-            self.facedown = []
-
-    def deal_card(self):
-        return self.faceup[-1].pop()
-
-    def group_cards(self):
-        groups = []
-        for i in range(len(self.cards)):
-            if i %3 == 0:
-                if i+3 < len(self.cards):
-                    groups.append(self.cards[i:i+3])
-                else:
-                    groups.append(self.cards[i:])
-        return groups
-    
-    def get_face_down(self):
-            face_down = 0
-            for column in self.table:
-                for card in column:
-                    if not card.face_up:
-                        face_down += 1
-            return face_down
 class SolitaireEnvironment:
-    def __init__(self):
-        self.deck = Deck()
-        self.table, self.top = self.set_table()
-        self.loopedCount = 0
-        self.previousFaceDown = 0
+    """Klondike, draw-three, with a configurable limit on stock redeals.
 
-    def move_possible(self, fromCard, destCard, top=False):
-        if not fromCard.face_up:
-            return False
+    None for max_redeals permits unlimited recycling (episodes still have a
+    finite step limit). Rewards are potential differences + a per-move cost;
+    moving cards backwards cannot repeatedly generate positive reward.
+    """
 
-        elif isinstance(destCard, int):
-            if destCard == -1:
-                if fromCard.value == 13:
-                    return True
-            elif fromCard.value == 1 and fromCard.suit == destCard:
-                return True
+    def __init__(self, seed: Optional[int] = None, draw_count: int = 3,
+                 max_redeals: Optional[int] = 2, max_steps: int = 400,
+                 max_stall: int = 150):
+        if draw_count not in (1, 3):
+            raise ValueError("draw_count must be 1 or 3")
+        if max_redeals is not None and max_redeals < 0:
+            raise ValueError("max_redeals must be nonnegative or None")
+        self.rng = random.Random(seed)
+        self.draw_count = draw_count
+        self.max_redeals = max_redeals
+        self.max_steps = max_steps
+        self.max_stall = max_stall
+        self.reset()
 
-        elif not destCard.face_up or fromCard.value != destCard.value + 1:
-            return False
+    def reset(self, seed: Optional[int] = None) -> np.ndarray:
+        if seed is not None:
+            self.rng.seed(seed)
+        cards = [Card(s, r) for s in range(4) for r in range(1, 14)]
+        self.rng.shuffle(cards)
+        self.tableau: list[list[Card]] = [[] for _ in range(TABLEAU)]
+        k = 0
+        for col in range(TABLEAU):
+            self.tableau[col] = cards[k:k + col + 1]
+            k += col + 1
+            self.tableau[col][-1].face_up = True
+        self.stock: list[Card] = cards[k:]
+        self.waste: list[Card] = []
+        self.foundation: list[list[Card]] = [[] for _ in range(SUITS)]
+        self.redeals = 0
+        self.steps = 0
+        self.stall = 0
+        self.done = False
+        self._best_progress = self._progress()
+        self._seen = {self._signature(): 1}
+        return self.observe()
 
-        elif top:
-            if fromCard.suit == destCard.suit:
-                return True
+    @staticmethod
+    def _tableau_fit(card: Card, destination: list[Card]) -> bool:
+        if not destination:
+            return card.rank == 13
+        top = destination[-1]
+        return top.face_up and card.rank + 1 == top.rank and card.color != top.color
 
-        elif fromCard.suit % 2 ^ destCard.suit % 2:
-            return True
+    def _foundation_fit(self, card: Card) -> bool:
+        return card.rank == len(self.foundation[card.suit]) + 1
 
-        return False
+    def legal_actions(self) -> list[Move]:
+        if self.done:
+            return []
+        moves: list[Move] = []
+        for src, pile in enumerate(self.tableau):
+            if not pile:
+                continue
+            for i, card in enumerate(pile):
+                if not card.face_up:
+                    continue
+                count = len(pile) - i
+                for dst, dest in enumerate(self.tableau):
+                    if src != dst and self._tableau_fit(card, dest):
+                        # Moving a fully visible pile onto an empty column is a
+                        # pointless column permutation, not useful exploration.
+                        if dest or i > 0:
+                            moves.append(Move("tableau_tableau", src, dst, count))
+            if self._foundation_fit(pile[-1]):
+                moves.append(Move("tableau_foundation", src, pile[-1].suit))
+        if self.waste:
+            card = self.waste[-1]
+            for dst, dest in enumerate(self.tableau):
+                if self._tableau_fit(card, dest):
+                    moves.append(Move("waste_tableau", -1, dst))
+            if self._foundation_fit(card):
+                moves.append(Move("waste_foundation", -1, card.suit))
+        for suit, pile in enumerate(self.foundation):
+            if pile:
+                for dst, dest in enumerate(self.tableau):
+                    if self._tableau_fit(pile[-1], dest):
+                        moves.append(Move("foundation_tableau", suit, dst))
+        if self.stock or (len(self.waste) > 1 and
+                          (self.max_redeals is None or self.redeals < self.max_redeals)):
+            moves.append(Move("draw"))
+        return moves
 
-    def move_card(self, card, dest, top, fromColumn, toColumn):
-        #move a card from one column to another
-        #if the card is the top card in the column, flip the new top card
-        #if the card is the only card in the column, the column is now empty
-        #check if the move is possible before moving the card
+    def _source_card(self, action: Move) -> Optional[Card]:
+        if action.kind == "draw":
+            return None
+        if action.kind.startswith("tableau_"):
+            return self.tableau[action.src][-action.count]
+        if action.kind.startswith("waste_"):
+            return self.waste[-1]
+        return self.foundation[action.src][-1]
 
-        #redundant but safe
-        if not self.move_possible(card, dest, top):
-            return False
+    def action_features(self, action: Move) -> np.ndarray:
+        """Features of an actually legal move. No hidden-card identities."""
+        f = np.zeros(ACTION_SIZE, dtype=np.float32)
+        f[ACTION_TYPES.index(action.kind)] = 1.0
+        offset = len(ACTION_TYPES)
+        if action.kind.startswith("tableau_"):
+            f[offset + action.src] = 1.0
+        elif action.kind.startswith("foundation_"):
+            f[offset + 7 + action.src] = 1.0
+        elif action.kind.startswith("waste_"):
+            f[offset + 11] = 1.0
+        offset += 12
+        if action.kind.endswith("tableau"):
+            f[offset + action.dst] = 1.0
+        elif action.kind.endswith("foundation"):
+            f[offset + 7 + action.dst] = 1.0
+        offset += 11
+        card = self._source_card(action)
+        if card is not None:
+            f[offset + card.rank - 1] = 1.0
+            f[offset + 13 + card.suit] = 1.0
+        offset += 17
+        f[offset] = action.count / 13.0
+        f[offset + 1] = float(action.kind == "tableau_tableau" and
+                               len(self.tableau[action.src]) > action.count and
+                               not self.tableau[action.src][-action.count - 1].face_up)
+        f[offset + 2] = (1.0 if action.kind.endswith("foundation") else
+                         -1.0 if action.kind.startswith("foundation_") else 0.0)
+        return f
 
-        if fromColumn > len(self.table)-1:
-            fromColumn -= len(self.table)
-            if card == self.top[fromColumn][-1]:
-                self.table[toColumn].append(self.top[fromColumn][-1])
-                self.top[fromColumn] = self.top[fromColumn][:-1]
-                if len(self.top[fromColumn]) > 0:
-                    if not self.top[fromColumn][-1].face_up:
-                        self.top[fromColumn][-1].flip()
-                return True
+    def _progress(self) -> float:
+        foundation_count = sum(map(len, self.foundation))
+        exposed = sum(sum(c.face_up for c in pile) for pile in self.tableau)
+        return 0.7 * foundation_count + 0.3 * exposed
 
-        for i in range(len(self.table[fromColumn])):
-            if self.table[fromColumn][i] == card:
-                #move the card and all cards below it to the new column
-                cards_to_move = self.table[fromColumn][i:]
-                self.table[fromColumn] = self.table[fromColumn][:i]
-                if toColumn > len(self.table)-1:
-                    self.top[toColumn - len(self.table)].extend(cards_to_move)
-                else:
-                    self.table[toColumn] += cards_to_move
-                if len(self.table[fromColumn]) > 0:
-                    if not self.table[fromColumn][-1].face_up:
-                        self.table[fromColumn][-1].flip()
-                return True
-        return False #if the move was not possible
+    def _signature(self) -> tuple:
+        # Public-state cycle detection: stock contents intentionally omitted.
+        tableau = tuple(tuple((c.suit, c.rank) if c.face_up else (-1, -1)
+                              for c in pile) for pile in self.tableau)
+        return (tableau, tuple(map(len, self.foundation)),
+                tuple((c.suit, c.rank) for c in self.waste),
+                len(self.stock), self.redeals)
 
-    def set_table(self):
-        table = []
-        cards = self.deck.table_cards
-        top = []
-        for i in range(4):
-            top.append([])
-        for i in range(7):
-            table.append([])
-        for i in range(7):
-            for j in range(i+1):
-                card = cards.pop()
-                if j == i:
-                    card.flip()
-                table[i].append(card)
-        return table, top
-    def encode_action(self, possible_action):
-        card, dest, top, fromColumn, toColumn = possible_action
-        #encode the action as an integer. We'll store it as a string right now to encode easier
-        action = ""
-        val = str(card.value)
-        if len(val) == 1:
-            action += "0"
-        action += val
-        action += str(card.suit % 2)
-        action += str(fromColumn)
-        action += str(toColumn)
-        action += str(top)
-        return int(action)
-    def decode_action(self, action):
-        if action == 0:
-            return "Draw"
+    def step(self, action: Move) -> tuple[float, bool, dict]:
+        if self.done:
+            raise RuntimeError("Episode ended; call reset")
+        # Validity is checked before modifying anything.
+        if action not in self.legal_actions():
+            raise ValueError(f"Illegal action: {action}")
+        before = self._progress()
+        if action.kind == "draw":
+            if not self.stock:
+                self.stock = list(reversed(self.waste))
+                self.waste.clear()
+                for c in self.stock:
+                    c.face_up = False
+                self.redeals += 1
+            for _ in range(min(self.draw_count, len(self.stock))):
+                card = self.stock.pop()
+                card.face_up = True
+                self.waste.append(card)
+        elif action.kind == "tableau_tableau":
+            src = self.tableau[action.src]
+            moving = src[-action.count:]
+            del src[-action.count:]
+            self.tableau[action.dst].extend(moving)
+            if src:
+                src[-1].face_up = True
+        elif action.kind == "tableau_foundation":
+            src = self.tableau[action.src]
+            self.foundation[action.dst].append(src.pop())
+            if src:
+                src[-1].face_up = True
+        elif action.kind == "waste_tableau":
+            self.tableau[action.dst].append(self.waste.pop())
+        elif action.kind == "waste_foundation":
+            self.foundation[action.dst].append(self.waste.pop())
+        elif action.kind == "foundation_tableau":
+            self.tableau[action.dst].append(self.foundation[action.src].pop())
+        self.steps += 1
+        progress = self._progress()
+        if progress > self._best_progress:
+            self.stall = 0
+            self._best_progress = progress
         else:
-            action = str(action)
-            #decode the action from an integer to a tuple
-            #first two digits are the card value
-            card = Card(int(action[0:2]), int(action[2]))
-            #next digit is the suit
-            card.suit = int(action[3])
-            #next digit is the from column
-            fromColumn = int(action[4])
-            #next digit is the to column
-            toColumn = int(action[5])
-            #next digit is whether the card is going to the top
-            top = bool(int(action[6]))
-            #if action is 1, fromcolumn is first column, tocolumn is second column.
-            #if action is 2, fromcolumn is first column, tocolumn is third column etc.
-            #use the action space to determine which columns to move from and to
-            # fromColumn = math.floor(action / (len(self.table)+len(self.top)))
-            # toColumn = (action % (len(self.table)+len(self.top)))-1
-            if fromColumn > len(self.table)-1:
-                if len(self.top[fromColumn - len(self.table)]) == 0:
-                    return False
+            self.stall += 1
+        signature = self._signature()
+        old_visits = self._seen.get(signature, 0)
+        self._seen[signature] = old_visits + 1
+        reward = progress - before - 0.02 - (0.05 if old_visits else 0.0)
+        won = all(len(pile) == 13 for pile in self.foundation)
+        if won:
+            reward += 15.0
+        no_actions = not self.legal_actions() if not won else False
+        truncated = self.steps >= self.max_steps or self.stall >= self.max_stall
+        self.done = won or no_actions or truncated
+        if self.done and not won:
+            reward -= 1.0
+        return reward, self.done, {
+            "won": won, "truncated": truncated,
+            "foundation_cards": sum(map(len, self.foundation)),
+            "face_down": sum(not c.face_up for p in self.tableau for c in p),
+            "steps": self.steps,
+        }
+
+    def observe(self) -> np.ndarray:
+        result = np.zeros(OBS_SIZE, dtype=np.float32)
+        at = 0
+        for pile in self.tableau:
+            result[at] = sum(not c.face_up for c in pile) / 6.0
+            at += 1
+            visible = [c for c in pile if c.face_up]
+            for slot, card in enumerate(visible):
+                start = at + slot * 5
+                result[start] = card.rank / 13.0
+                result[start + 1 + card.suit] = 1.0
+            at += MAX_CARDS * 5
+        for pile in self.foundation:
+            result[at] = len(pile) / 13.0
+            at += 1
+        result[at:at+4] = [len(self.stock) / 24.0, len(self.waste) / 24.0,
+                            (self.redeals / max(1, self.max_redeals)
+                             if self.max_redeals is not None else 0.0),
+                            self.steps / self.max_steps]
+        at += 4
+        for i, card in enumerate(self.waste[-24:]):
+            start = at + i * 5
+            result[start] = card.rank / 13.0
+            result[start + 1 + card.suit] = 1.0
+        at += 24 * 5
+        if self.waste:
+            top = self.waste[-1]
+            result[at + top.suit * 13 + top.rank - 1] = 1.0
+        return result
+
+    def assert_valid(self) -> None:
+        """Debug invariant checks, not used inside the training hot loop."""
+        piles = self.tableau + self.foundation + [self.stock, self.waste]
+        cards = [c for pile in piles for c in pile]
+        assert len(cards) == 52
+        assert len({(c.suit, c.rank) for c in cards}) == 52
+        for suit, pile in enumerate(self.foundation):
+            assert [(c.suit, c.rank) for c in pile] == [(suit, r) for r in range(1, len(pile)+1)]
+        for pile in self.tableau:
+            seen_up = False
+            for c in pile:
+                if c.face_up:
+                    seen_up = True
                 else:
-                    card = self.top[fromColumn - len(self.table)][-1]
-            elif len(self.table[fromColumn]) == 0:
-                return False
-            else:
-                card = self.table[fromColumn][-1]
-            if toColumn > len(self.table)-1:
-                if len(self.top[toColumn - len(self.table)]) == 0:
-                    dest = toColumn - len(self.table)
-                else:
-                    dest = (self.top[toColumn - len(self.table)][-1].value, toColumn - len(self.table))
-                top = True
-            else:
-                if len(self.table[toColumn]) == 0:
-                    dest = -1
-                else:
-                    dest = self.table[toColumn][-1]
-                top = False
-            if not self.move_possible(card, dest, top):
-                return False
-            return (card, dest, top, fromColumn, toColumn)
-        
-    def step(self, action):
-        action = self.decode_action(int(action))
-        # Example action decoding (you need to define this based on your game's rules)
-        if action == "Draw":
-            self.deck.draw()
-        elif action == False:
-            return -1, False, {"error": "Invalid move"}
-        else:
-            card, dest, top, fromColumn, toColumn = action
-            move = self.move_card(card, dest, top, fromColumn, toColumn)
-            if not move:
-                return -1, False, {"error": "Invalid move"}
-
-        over, result = self.check_game_over()
-        reward = self.calculate_reward(result)
-
-        return reward, over, {}
-
-    def calculate_reward(self, result):
-        # Define your reward function here
-        if result == "Win":
-            return 1
-        elif result == "Lose":
-            return -1
-        else:
-            #scale reward by number of remaining cards face down on table
-            return .5 - (self.deck.face_down / 28)
-
-    def check_game_over(self):
-        if self.deck.face_down == self.previousFaceDown:
-            self.loopedCount += 1
-        else:
-            self.loopedCount = 0
-        self.previousFaceDown = self.deck.face_down
-
-        # Check for winning condition
-        if all(len(pile) == 13 for pile in self.top):
-            return True, "Win"
-
-        # Check for losing condition: no more legal moves
-        # This can be complex as it requires checking all possible moves in the current game state.
-        # You may need to implement additional helper methods to check for possible moves.
-        if not self.any_legal_moves() or self.loopedCount > 1000:
-            return True, "Lose"
-
-        return False, "Continue"
-
-    def any_legal_moves(self):
-        # Check for moves within the tableau
-        for i in range(len(self.table)):
-            for j in range(len(self.table)):
-                if i != j and len(self.table[i]) > 0 and len(self.table[j]) > 0:
-                    if self.move_possible(self.table[i][-1], self.table[j][-1]):
-                        return True
-        # Check for moves from deck to tableau or foundation piles
-        for i in range(len(self.table)):
-            if len(self.table[i]) > 0:
-                if self.move_possible(self.deck.faceup[-1][-1], self.table[i][-1]):
-                    return True
-        return False
-    
-    def get_possible_actions(self):
-        #first, check if there are any legal moves
-        if not self.any_legal_moves():
-            return False
-        #if there are legal moves, get a list of all possible moves
-        possible_actions = []
-        
-        for fromColumn in range(len(self.table)):
-            if len(self.table[fromColumn]) > 0:
-                for card in range(len(self.table[fromColumn])):
-                    for toColumn in range(len(self.table)):
-                        if fromColumn != toColumn:
-                            if len(self.table[toColumn]) > 0:
-                                dest = self.table[toColumn][-1]
-                            else:
-                                dest = -1
-                            if self.move_possible(card, dest):
-                                possible_actions.append((card, dest, False, fromColumn, toColumn))
-                for toColumn in range(len(self.top)):
-                    if len(self.top[toColumn]) > 0:
-                        dest = self.top[toColumn][-1]
-                    else:
-                        dest = toColumn
-                    if self.move_possible(self.table[fromColumn][-1], dest, True):
-                        possible_actions.append((self.table[fromColumn][-1], dest, True, fromColumn, toColumn + len(self.table)))
-    
-        for fromColumn in range(len(self.top)):
-            if len(self.top[fromColumn]) > 0:
-                for toColumn in range(len(self.table)):
-                    if len(self.table[toColumn]) > 0:
-                        dest = self.table[toColumn][-1]
-                    else:
-                        dest = -1
-                    if self.move_possible(self.top[fromColumn][-1], dest):
-                        possible_actions.append((self.top[fromColumn][-1], dest, False, fromColumn + len(self.table), toColumn))
-        #TODO: also iterate through the deck
-
-    def reset(self):
-        self.__init__()
+                    assert not seen_up
+            visible = [c for c in pile if c.face_up]
+            for below, above in zip(visible, visible[1:]):
+                assert below.rank == above.rank + 1 and below.color != above.color
